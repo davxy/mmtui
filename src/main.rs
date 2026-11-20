@@ -41,7 +41,6 @@ async fn main() -> udisks2::Result<()> {
     let mut tui = Tui::default();
     loop {
         tui.drv = state.lock().await.to_vec();
-        tui.selected = None;
         terminal
             .draw(|f| tui.draw(f))
             .expect("failed to draw frame");

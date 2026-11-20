@@ -18,7 +18,7 @@ pub enum InputResult {
 pub struct Tui {
     ts: TableState,
     pub drv: Vec<drives::Drive>,
-    pub selected: Option<drives::Block>,
+    selected: Option<drives::Block>,
     pub last_status: String,
 }
 
@@ -36,10 +36,12 @@ impl Tui {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.ts.select_previous();
+                self.selected = None;
                 InputResult::None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.ts.select_next();
+                self.selected = None;
                 InputResult::None
             }
             KeyCode::Char('m') => {
@@ -88,6 +90,14 @@ impl Tui {
         block.clone().render(layout[0], frame.buffer_mut());
 
         let rows: Vec<drives::Block> = self.drv.iter().flat_map(|d| d.blocks.clone()).collect();
+
+        if let Some(row) = self
+            .selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| same_device(row, selected)))
+        {
+            self.ts.select(Some(row));
+        }
 
         if self.ts.selected().is_none() && !self.drv.is_empty() {
             self.ts.select(Some(0));
@@ -155,5 +165,115 @@ impl Tui {
         let info = format!("{} | {HELP}\n{descr}", self.last_status);
         let info = Paragraph::new(info).wrap(Wrap { trim: true });
         frame.render_widget(info, layout[1]);
+    }
+}
+
+fn same_device(first: &drives::Block, second: &drives::Block) -> bool {
+    // Rows from /proc/self/mounts and fstab have no udisks object path.
+    if first.object_path.is_empty() {
+        first.dev == second.dev && first.mount == second.mount
+    } else {
+        first.object_path == second.object_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn block(object_path: &str, dev: &str, mount: Option<&str>) -> drives::Block {
+        drives::Block {
+            object_path: object_path.to_owned(),
+            drive_path: String::new(),
+            dev: dev.to_owned(),
+            label: String::new(),
+            mount: mount.map(str::to_owned),
+            fstype: String::new(),
+            mounted: mount.is_some(),
+            size: String::new(),
+        }
+    }
+
+    fn udisks_block(dev: &str, mount: Option<&str>) -> drives::Block {
+        let object_path = dev.replace("/dev/", "/org/freedesktop/UDisks2/block_devices/");
+        block(&object_path, dev, mount)
+    }
+
+    fn fstab_block(dev: &str, mount: &str) -> drives::Block {
+        block("", dev, Some(mount))
+    }
+
+    fn show(tui: &mut Tui, blocks: Vec<drives::Block>) {
+        tui.drv = vec![drives::Drive {
+            id: String::new(),
+            object_path: String::new(),
+            model: String::new(),
+            ejectable: false,
+            blocks,
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+    }
+
+    fn selected(tui: &Tui) -> &drives::Block {
+        tui.selected.as_ref().unwrap()
+    }
+
+    // A device can appear while the user looks at the list. `m`, `u` and `e` act on the selected row,
+    // so the cursor must stay on the device that the user selected, also when that device gets mounted.
+    #[tokio::test]
+    async fn selection_stays_on_device_when_rows_move() {
+        let mut tui = Tui::default();
+        let rows = vec![
+            udisks_block("/dev/sdb1", None),
+            udisks_block("/dev/sdc1", None),
+        ];
+        show(&mut tui, rows.clone());
+        tui.input(KeyCode::Down.into()).await;
+        show(&mut tui, rows);
+
+        let new_device = udisks_block("/dev/sda1", None);
+        let rows = vec![
+            new_device,
+            udisks_block("/dev/sdb1", None),
+            udisks_block("/dev/sdc1", Some("/mnt/c")),
+        ];
+        show(&mut tui, rows);
+        assert_eq!(selected(&tui).dev, "/dev/sdc1");
+    }
+
+    // The cursor follows the device from one frame to the next, but a key must still move it.
+    #[tokio::test]
+    async fn down_key_moves_to_next_device() {
+        let mut tui = Tui::default();
+        let blocks = vec![
+            udisks_block("/dev/sda1", None),
+            udisks_block("/dev/sdb1", None),
+        ];
+        show(&mut tui, blocks.clone());
+        tui.input(KeyCode::Down.into()).await;
+        show(&mut tui, blocks);
+        assert_eq!(selected(&tui).dev, "/dev/sdb1");
+    }
+
+    // fstab can have many lines with the same dev, for example btrfs subvolumes.
+    // These rows have no udisks object path, so only the mount path tells them apart.
+    #[tokio::test]
+    async fn fstab_rows_with_same_dev_stay_apart() {
+        let mut tui = Tui::default();
+        let subvolumes = vec![
+            fstab_block("UUID=1234", "/home"),
+            fstab_block("UUID=1234", "/var/log"),
+        ];
+        show(&mut tui, subvolumes.clone());
+        tui.input(KeyCode::Down.into()).await;
+        show(&mut tui, subvolumes.clone());
+
+        show(
+            &mut tui,
+            [vec![udisks_block("/dev/sda1", None)], subvolumes].concat(),
+        );
+        assert_eq!(selected(&tui).mount.as_deref(), Some("/var/log"));
     }
 }
