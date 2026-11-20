@@ -39,7 +39,7 @@ impl Config {
         let basedirs = BaseDirectories::with_prefix("mmtui");
         let path = basedirs.find_config_file("mmtui.toml")?;
 
-        println!("Load config file from: {}", path.display());
+        eprintln!("Load config file from: {}", path.display());
 
         let data = match fs::read_to_string(&path) {
             Ok(data) => data,
