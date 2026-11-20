@@ -22,7 +22,7 @@ pub struct Tui {
     pub last_status: String,
 }
 
-const HELP: &str = "j/▲⋮k/▼⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
+const HELP: &str = "j/▼⋮k/▲⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
 
 impl Tui {
     fn set_status(&mut self, res: udisks2::Result<()>) {
@@ -62,7 +62,7 @@ impl Tui {
                 }
                 InputResult::None
             }
-            KeyCode::Enter | KeyCode::Char('l' | 'o') => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | 'o') => {
                 if let Some(s) = &self.selected {
                     let output = s.clone().mount.unwrap_or_default();
                     InputResult::QuitChangeDirectory(output)
@@ -275,5 +275,14 @@ mod tests {
             [vec![udisks_block("/dev/sda1", None)], subvolumes].concat(),
         );
         assert_eq!(selected(&tui).mount.as_deref(), Some("/var/log"));
+    }
+
+    // The help line shows ▶ for CD.
+    #[tokio::test]
+    async fn right_key_changes_directory() {
+        let mut tui = Tui::default();
+        show(&mut tui, vec![udisks_block("/dev/sda1", Some("/mnt/a"))]);
+        let result = tui.input(KeyCode::Right.into()).await;
+        assert!(matches!(result, InputResult::QuitChangeDirectory(path) if path == "/mnt/a"));
     }
 }
