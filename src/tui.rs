@@ -20,11 +20,22 @@ pub struct Tui {
     pub drv: Vec<drives::Drive>,
     selected: Option<drives::Block>,
     pub last_status: String,
+    scan_error: Option<String>,
 }
 
 const HELP: &str = "j/▼⋮k/▲⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
 
 impl Tui {
+    pub fn update(&mut self, scan: &Result<Vec<drives::Drive>, String>) {
+        match scan {
+            Ok(drives) => {
+                self.drv.clone_from(drives);
+                self.scan_error = None;
+            }
+            Err(error) => self.scan_error = Some(error.clone()),
+        }
+    }
+
     fn set_status(&mut self, res: udisks2::Result<()>) {
         self.last_status = match res {
             Ok(()) => String::from("Ok"),
@@ -162,7 +173,11 @@ impl Tui {
             None => String::new(),
         };
 
-        let info = format!("{} | {HELP}\n{descr}", self.last_status);
+        let status = match &self.scan_error {
+            Some(error) => format!("Error: {error}"),
+            None => self.last_status.clone(),
+        };
+        let info = format!("{status} | {HELP}\n{descr}");
         let info = Paragraph::new(info).wrap(Wrap { trim: true });
         frame.render_widget(info, layout[1]);
     }
@@ -204,16 +219,35 @@ mod tests {
         block("", dev, Some(mount))
     }
 
-    fn show(tui: &mut Tui, blocks: Vec<drives::Block>) {
-        tui.drv = vec![drives::Drive {
+    fn drive(blocks: Vec<drives::Block>) -> drives::Drive {
+        drives::Drive {
             id: String::new(),
             object_path: String::new(),
             model: String::new(),
             ejectable: false,
             blocks,
-        }];
+        }
+    }
+
+    fn draw(tui: &mut Tui) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| tui.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width.into())
+            .map(|line| {
+                line.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn show(tui: &mut Tui, blocks: Vec<drives::Block>) {
+        tui.drv = vec![drive(blocks)];
+        draw(tui);
     }
 
     fn selected(tui: &Tui) -> &drives::Block {
@@ -275,6 +309,21 @@ mod tests {
             [vec![udisks_block("/dev/sda1", None)], subvolumes].concat(),
         );
         assert_eq!(selected(&tui).mount.as_deref(), Some("/var/log"));
+    }
+
+    // udisks can stop or fail. The user must see why the list is empty or old.
+    #[test]
+    fn scan_error_shows_until_next_good_scan() {
+        let mut tui = Tui::default();
+        let good_scan = Ok(vec![drive(vec![udisks_block("/dev/sda1", None)])]);
+        tui.update(&good_scan);
+        tui.update(&Err("udisks is not running".to_owned()));
+        let screen = draw(&mut tui);
+        assert!(screen.contains("Error: udisks is not running"));
+        assert!(screen.contains("/dev/sda1"));
+
+        tui.update(&good_scan);
+        assert!(!draw(&mut tui).contains("Error"));
     }
 
     // The help line shows ▶ for CD.

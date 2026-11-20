@@ -11,7 +11,10 @@ pub struct MountPoint {
 
 impl MountPoint {
     pub fn collect_from_file(path: &str, config: &Config) -> Vec<MountPoint> {
-        std::io::BufReader::new(std::fs::File::open(PathBuf::from(path)).unwrap())
+        let Ok(file) = std::fs::File::open(PathBuf::from(path)) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
             .lines()
             .map_while(Result::ok)
             .filter_map(|l| {
@@ -121,5 +124,13 @@ mod tests {
             "/dev/sdd1 /mnt/a\\777b\\08c\\+12\\ ext4 rw 0 0\n",
         );
         assert_eq!(mounts[0].path.as_deref(), Some("/mnt/a\\777b\\08c\\+12\\"));
+    }
+
+    // /etc/fstab is optional. A panic here stops the scan task, and the table never changes again.
+    #[test]
+    fn missing_file_gives_no_mount_points() {
+        let file = std::env::temp_dir().join(format!("mmtui-{}-missing", std::process::id()));
+        let mounts = MountPoint::collect_from_file(file.to_str().unwrap(), &Config::default());
+        assert!(mounts.is_empty());
     }
 }

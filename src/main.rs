@@ -26,13 +26,13 @@ async fn main() -> udisks2::Result<()> {
     let mut interval = tokio::time::interval(period);
     let mut events = EventStream::new();
 
-    let state: Arc<Mutex<Vec<drives::Drive>>> = Arc::new(Mutex::new(Vec::new()));
+    let state: Arc<Mutex<Result<Vec<drives::Drive>, String>>> =
+        Arc::new(Mutex::new(Ok(Vec::new())));
     let s = state.clone();
     tokio::spawn(async move {
         loop {
-            if let Ok(drv) = drives::collect_all(&config).await {
-                s.lock().await.clone_from(&drv);
-            }
+            let scan = drives::collect_all(&config).await;
+            *s.lock().await = scan.map_err(|error| format!("udisks: {error}"));
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
@@ -40,7 +40,7 @@ async fn main() -> udisks2::Result<()> {
     let mut output_change_path = String::new();
     let mut tui = Tui::default();
     loop {
-        tui.drv = state.lock().await.to_vec();
+        tui.update(&*state.lock().await);
         terminal
             .draw(|f| tui.draw(f))
             .expect("failed to draw frame");
