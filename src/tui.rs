@@ -258,26 +258,30 @@ impl Tui {
         frame.render_widget(info, layout[1]);
 
         if let Some(prompt) = &self.passphrase_prompt {
-            let [area] = Layout::vertical([Constraint::Length(3)])
-                .flex(Flex::Center)
-                .areas(frame.area());
-            let [area] = Layout::horizontal([Constraint::Percentage(60)])
-                .flex(Flex::Center)
-                .areas(area);
-            let block = Block::bordered()
-                .title(Line::styled(
-                    format!("Passphrase for {}", prompt.block.dev),
-                    Color::White,
-                ))
-                .title_bottom(PROMPT_HELP)
-                .title_alignment(Alignment::Center)
-                .border_type(BorderType::Rounded)
-                .border_style(Color::Yellow);
-            let hidden_passphrase = "*".repeat(prompt.passphrase.chars().count());
-            frame.render_widget(Clear, area);
-            frame.render_widget(Paragraph::new(hidden_passphrase).block(block), area);
+            draw_passphrase_prompt(frame, prompt);
         }
     }
+}
+
+fn draw_passphrase_prompt(frame: &mut Frame, prompt: &PassphrasePrompt) {
+    let [area] = Layout::vertical([Constraint::Length(3)])
+        .flex(Flex::Center)
+        .areas(frame.area());
+    let [area] = Layout::horizontal([Constraint::Percentage(60)])
+        .flex(Flex::Center)
+        .areas(area);
+    let block = Block::bordered()
+        .title(Line::styled(
+            format!("Passphrase for {}", prompt.block.dev),
+            Color::White,
+        ))
+        .title_bottom(PROMPT_HELP)
+        .title_alignment(Alignment::Center)
+        .border_type(BorderType::Rounded)
+        .border_style(Color::Yellow);
+    let hidden_passphrase = "*".repeat(prompt.passphrase.chars().count());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(hidden_passphrase).block(block), area);
 }
 
 fn short_mount_path(block: &drives::Block) -> String {

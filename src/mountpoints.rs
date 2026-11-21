@@ -20,7 +20,7 @@ impl MountPoint {
                 Some(MountPoint {
                     dev: parts
                         .next()
-                        .and_then(|d| if d.starts_with('#') { None } else { Some(d) })
+                        .filter(|d| !d.starts_with('#'))
                         .map(decode_octal_escapes)?,
                     path: Some(decode_octal_escapes(parts.next()?)),
                     fs: decode_octal_escapes(parts.next()?),
