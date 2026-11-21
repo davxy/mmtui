@@ -24,11 +24,24 @@ jobs:
             - name: Check formatting
               run: cargo fmt --all --check
             - name: Run Clippy
-              run: cargo clippy --all -- -D warnings
+              run: cargo clippy --all --all-targets -- -D warnings
+
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+            - name: Install Rust
+              uses: dtolnay/rust-toolchain@stable
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  cache-on-failure: true
+            - name: Run tests
+              run: cargo test --all
 
     release_please:
         name: Release Management
-        needs: [check]
+        needs: [check, test]
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         runs-on: ubuntu-latest
         permissions:

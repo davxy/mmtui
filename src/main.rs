@@ -18,6 +18,15 @@ use tui::{InputResult, Tui};
 #[tokio::main]
 async fn main() -> udisks2::Result<()> {
     let config = Config::load_or_default();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // tokio catches a panic in a task, and mmtui keeps running.
+        if std::thread::current().name() == Some("main") {
+            let _ = disable_raw_mode();
+            let _ = execute!(stderr(), LeaveAlternateScreen);
+        }
+        default_hook(info);
+    }));
     enable_raw_mode().unwrap();
     execute!(stderr(), EnterAlternateScreen).unwrap();
     let mut terminal = Terminal::new(CrosstermBackend::new(stderr())).unwrap();
@@ -26,13 +35,13 @@ async fn main() -> udisks2::Result<()> {
     let mut interval = tokio::time::interval(period);
     let mut events = EventStream::new();
 
-    let state: Arc<Mutex<Vec<drives::Drive>>> = Arc::new(Mutex::new(Vec::new()));
+    let state: Arc<Mutex<Result<Vec<drives::Drive>, String>>> =
+        Arc::new(Mutex::new(Ok(Vec::new())));
     let s = state.clone();
     tokio::spawn(async move {
         loop {
-            if let Ok(drv) = drives::collect_all(&config).await {
-                s.lock().await.clone_from(&drv);
-            }
+            let scan = drives::collect_all(&config).await;
+            *s.lock().await = scan.map_err(|error| format!("udisks: {error}"));
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
@@ -40,8 +49,8 @@ async fn main() -> udisks2::Result<()> {
     let mut output_change_path = String::new();
     let mut tui = Tui::default();
     loop {
-        tui.drv = state.lock().await.to_vec();
-        tui.selected = None;
+        tui.update(&*state.lock().await);
+        tui.finish_operation().await;
         terminal
             .draw(|f| tui.draw(f))
             .expect("failed to draw frame");
@@ -52,7 +61,7 @@ async fn main() -> udisks2::Result<()> {
         };
 
         if key.kind == KeyEventKind::Press {
-            match tui.input(key).await {
+            match tui.input(key) {
                 InputResult::None => {}
                 InputResult::Quit => break,
                 InputResult::QuitChangeDirectory(p) => {

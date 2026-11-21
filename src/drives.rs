@@ -147,9 +147,12 @@ pub async fn collect_drives_from_udisk() -> udisks2::Result<Vec<Drive>> {
 }
 
 pub async fn collect_all(config: &Config) -> udisks2::Result<Vec<Drive>> {
-    let mut drives = collect_drives_from_udisk().await?;
+    let drives = collect_drives_from_udisk().await?;
     let mounts = mountpoints::MountPoint::collect(config);
+    Ok(merge_mounts(drives, mounts))
+}
 
+fn merge_mounts(mut drives: Vec<Drive>, mounts: Vec<mountpoints::MountPoint>) -> Vec<Drive> {
     let mut fstab = Drive {
         id: "fstab".to_owned(),
         object_path: "fstab".to_owned(),
@@ -164,8 +167,11 @@ pub async fn collect_all(config: &Config) -> udisks2::Result<Vec<Drive>> {
             .find(|d| d.blocks.iter().any(|b| b.has_device(&i.dev)))
             .and_then(|d| d.blocks.iter_mut().find(|b| b.has_device(&i.dev)));
         if let Some(block) = block {
-            block.mount = i.path;
-            block.mounted = i.mounted;
+            // The first line is the first mount, and the fstab lines that are not mounted come last.
+            if block.mount.is_none() {
+                block.mount = i.path;
+                block.mounted = i.mounted;
+            }
         } else {
             fstab.blocks.push(Block {
                 object_path: String::new(),
@@ -187,7 +193,7 @@ pub async fn collect_all(config: &Config) -> udisks2::Result<Vec<Drive>> {
         i.blocks.sort_by_cached_key(|b| b.dev.clone());
     }
 
-    Ok(drives)
+    drives
 }
 
 pub async fn mount(block: &Block) -> udisks2::Result<()> {
@@ -315,5 +321,64 @@ mod tests {
         let block = luks_block(Encryption::Locked);
         assert!(block.has_device("/dev/sdc2"));
         assert!(!block.has_device("/dev/mapper/luks-1234"));
+    }
+
+    fn drive_with_block(dev: &str) -> Drive {
+        Drive {
+            id: String::new(),
+            object_path: "/org/freedesktop/UDisks2/drives/disk".to_owned(),
+            model: String::new(),
+            ejectable: false,
+            blocks: vec![Block {
+                dev: dev.to_owned(),
+                fstype: "btrfs".to_owned(),
+                ..luks_block(Encryption::Unencrypted)
+            }],
+        }
+    }
+
+    fn mount_line(dev: &str, path: &str, mounted: bool) -> mountpoints::MountPoint {
+        mountpoints::MountPoint {
+            dev: dev.to_owned(),
+            path: Some(path.to_owned()),
+            fs: "btrfs".to_owned(),
+            mounted,
+        }
+    }
+
+    fn block_of<'a>(drives: &'a [Drive], dev: &str) -> &'a Block {
+        drives
+            .iter()
+            .flat_map(|drive| &drive.blocks)
+            .find(|block| block.dev == dev)
+            .unwrap()
+    }
+
+    // A btrfs partition is often mounted many times, one subvolume at each path.
+    // The row must show the first mount (the root subvolume at / on a usual system), not the last one,
+    // which can be any subvolume (on the test system /var/cache/pacman/pkg). `l` goes to this path.
+    #[test]
+    fn device_with_many_mounts_shows_first_mount() {
+        let mounts = vec![
+            mount_line("/dev/sda2", "/", true),
+            mount_line("/dev/sda2", "/home", true),
+            mount_line("/dev/sda2", "/var/cache/pacman/pkg", true),
+        ];
+        let drives = merge_mounts(vec![drive_with_block("/dev/sda2")], mounts);
+        assert_eq!(block_of(&drives, "/dev/sda2").mount.as_deref(), Some("/"));
+    }
+
+    // MountPoint::collect lists the fstab lines that are not mounted after the mounted lines.
+    // Such a line must not hide a real mount of the same device, else the row shows O for a mounted device.
+    #[test]
+    fn fstab_line_does_not_hide_real_mount() {
+        let mounts = vec![
+            mount_line("/dev/sdb1", "/run/media/user/data", true),
+            mount_line("/dev/sdb1", "/mnt/data", false),
+        ];
+        let drives = merge_mounts(vec![drive_with_block("/dev/sdb1")], mounts);
+        let block = block_of(&drives, "/dev/sdb1");
+        assert_eq!(block.mount.as_deref(), Some("/run/media/user/data"));
+        assert!(block.mounted);
     }
 }
