@@ -1,10 +1,10 @@
 use crate::drives;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::{Alignment, Constraint, Layout},
+    layout::{Alignment, Constraint, Flex, Layout},
     style::Color,
     text::Line,
-    widgets::{Block, BorderType, Padding, Paragraph, Row, Table, TableState, Widget, Wrap},
+    widgets::{Block, BorderType, Clear, Padding, Paragraph, Row, Table, TableState, Widget, Wrap},
     Frame,
 };
 
@@ -21,9 +21,16 @@ pub struct Tui {
     selected: Option<drives::Block>,
     pub last_status: String,
     scan_error: Option<String>,
+    passphrase_prompt: Option<PassphrasePrompt>,
+}
+
+struct PassphrasePrompt {
+    block: drives::Block,
+    passphrase: String,
 }
 
 const HELP: &str = "j/▼⋮k/▲⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
+const PROMPT_HELP: &str = "Enter - Unlock⋮Esc - Cancel";
 
 impl Tui {
     pub fn update(&mut self, scan: &Result<Vec<drives::Drive>, String>) {
@@ -44,6 +51,25 @@ impl Tui {
     }
 
     pub async fn input(&mut self, key: KeyEvent) -> InputResult {
+        if let Some(prompt) = &mut self.passphrase_prompt {
+            match key.code {
+                KeyCode::Char(character) => prompt.passphrase.push(character),
+                KeyCode::Backspace => {
+                    prompt.passphrase.pop();
+                }
+                KeyCode::Esc => self.passphrase_prompt = None,
+                KeyCode::Enter => {
+                    if let Some(prompt) = self.passphrase_prompt.take() {
+                        self.set_status(
+                            drives::unlock_and_mount(&prompt.block, &prompt.passphrase).await,
+                        );
+                    }
+                }
+                _ => {}
+            }
+            return InputResult::None;
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.ts.select_previous();
@@ -57,7 +83,14 @@ impl Tui {
             }
             KeyCode::Char('m') => {
                 if let Some(b) = &self.selected {
-                    self.set_status(drives::mount(b).await);
+                    if let drives::Encryption::Locked = b.encryption {
+                        self.passphrase_prompt = Some(PassphrasePrompt {
+                            block: b.clone(),
+                            passphrase: String::new(),
+                        });
+                    } else {
+                        self.set_status(drives::mount(b).await);
+                    }
                 }
                 InputResult::None
             }
@@ -119,18 +152,26 @@ impl Tui {
             .and_then(|n| rows.get(n).cloned())
             .clone_into(&mut self.selected);
 
-        let max_size_field_length: u16 = rows
-            .iter()
-            .map(|r| r.size.len())
-            .max()
-            .unwrap_or(0)
-            .try_into()
-            .unwrap_or(0);
+        let max_field_length = |field: fn(&drives::Block) -> &str| -> u16 {
+            rows.iter()
+                .map(|r| field(r).len())
+                .max()
+                .unwrap_or(0)
+                .try_into()
+                .unwrap_or(0)
+        };
+        let table_area = block.inner(layout[0]);
+        let max_dev_field_length = max_field_length(|r| &r.dev);
+        let max_label_field_length = max_field_length(|r| &r.label);
+        let max_fstype_field_length = max_field_length(|r| &r.fstype);
+        let max_mount_field_length = max_field_length(|r| r.mount.as_deref().unwrap_or_default());
+        let max_size_field_length = max_field_length(|r| &r.size);
 
         let rows = rows.iter().map(|i| {
             Row::new(vec![
                 i.dev.clone(),
                 i.label.clone(),
+                i.fstype.clone(),
                 i.mount.clone().unwrap_or_default(),
                 i.size.clone(),
                 if i.mounted {
@@ -141,9 +182,10 @@ impl Tui {
             ])
         });
         let widths = [
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Fill(max_dev_field_length.min(table_area.width / 3)),
+            Constraint::Fill(max_label_field_length),
+            Constraint::Fill(max_fstype_field_length),
+            Constraint::Fill(max_mount_field_length),
             Constraint::Length(max_size_field_length),
             Constraint::Length(1),
         ];
@@ -151,7 +193,7 @@ impl Tui {
             .row_highlight_style(Color::Green)
             .highlight_symbol(">");
 
-        frame.render_stateful_widget(table, block.inner(layout[0]), &mut self.ts);
+        frame.render_stateful_widget(table, table_area, &mut self.ts);
 
         let descr = match &self.selected {
             Some(s) => {
@@ -180,6 +222,27 @@ impl Tui {
         let info = format!("{status} | {HELP}\n{descr}");
         let info = Paragraph::new(info).wrap(Wrap { trim: true });
         frame.render_widget(info, layout[1]);
+
+        if let Some(prompt) = &self.passphrase_prompt {
+            let [area] = Layout::vertical([Constraint::Length(3)])
+                .flex(Flex::Center)
+                .areas(frame.area());
+            let [area] = Layout::horizontal([Constraint::Percentage(60)])
+                .flex(Flex::Center)
+                .areas(area);
+            let block = Block::bordered()
+                .title(Line::styled(
+                    format!("Passphrase for {}", prompt.block.dev),
+                    Color::White,
+                ))
+                .title_bottom(PROMPT_HELP)
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Rounded)
+                .border_style(Color::Yellow);
+            let hidden_passphrase = "*".repeat(prompt.passphrase.chars().count());
+            frame.render_widget(Clear, area);
+            frame.render_widget(Paragraph::new(hidden_passphrase).block(block), area);
+        }
     }
 }
 
@@ -197,6 +260,144 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn tui_with_locked_luks_row() -> Tui {
+        let block = drives::Block {
+            object_path: "/org/freedesktop/UDisks2/block_devices/sdc2".to_owned(),
+            drive_path: "/org/freedesktop/UDisks2/drives/disk".to_owned(),
+            dev: "/dev/sdc2".to_owned(),
+            label: String::new(),
+            mount: None,
+            fstype: "crypto_LUKS".to_owned(),
+            mounted: false,
+            size: String::new(),
+            encryption: drives::Encryption::Locked,
+        };
+        Tui {
+            selected: Some(block),
+            ..Tui::default()
+        }
+    }
+
+    async fn press(tui: &mut Tui, code: KeyCode) -> InputResult {
+        tui.input(KeyEvent::from(code)).await
+    }
+
+    async fn type_text(tui: &mut Tui, text: &str) {
+        for character in text.chars() {
+            press(tui, KeyCode::Char(character)).await;
+        }
+    }
+
+    // udisks cannot mount a locked device. `m` must ask for the passphrase of
+    // the selected device and must not send a mount request.
+    #[tokio::test]
+    async fn mount_of_locked_device_asks_for_passphrase() {
+        let mut tui = tui_with_locked_luks_row();
+        press(&mut tui, KeyCode::Char('m')).await;
+        let prompt = tui.passphrase_prompt.expect("no passphrase prompt");
+        assert_eq!(prompt.block.dev, "/dev/sdc2");
+        assert_eq!(tui.last_status, "");
+    }
+
+    // A passphrase can contain command keys, for example `q`. In the prompt
+    // they must become passphrase text, and must not quit or start a command.
+    #[tokio::test]
+    async fn prompt_takes_command_keys_as_passphrase_text() {
+        let mut tui = tui_with_locked_luks_row();
+        press(&mut tui, KeyCode::Char('m')).await;
+        for character in "qmuejkl".chars() {
+            let result = press(&mut tui, KeyCode::Char(character)).await;
+            assert!(matches!(result, InputResult::None));
+        }
+        press(&mut tui, KeyCode::Backspace).await;
+        let prompt = tui.passphrase_prompt.expect("prompt closed");
+        assert_eq!(prompt.passphrase, "qmuejk");
+    }
+
+    // Esc must cancel: no unlock request (it sets a status), and the normal
+    // keys work again.
+    #[tokio::test]
+    async fn escape_closes_prompt_without_unlock() {
+        let mut tui = tui_with_locked_luks_row();
+        press(&mut tui, KeyCode::Char('m')).await;
+        type_text(&mut tui, "secret").await;
+        let result = press(&mut tui, KeyCode::Esc).await;
+        assert!(matches!(result, InputResult::None));
+        assert!(tui.passphrase_prompt.is_none());
+        assert_eq!(tui.last_status, "");
+        assert!(matches!(
+            press(&mut tui, KeyCode::Char('q')).await,
+            InputResult::Quit
+        ));
+    }
+
+    fn render_row(dev: &str, terminal_width: u16) -> String {
+        let mut tui = Tui {
+            drv: vec![drives::Drive {
+                id: String::new(),
+                object_path: "/drive".to_owned(),
+                model: String::new(),
+                ejectable: false,
+                blocks: vec![drives::Block {
+                    object_path: String::new(),
+                    drive_path: "/drive".to_owned(),
+                    dev: dev.to_owned(),
+                    label: "photos".to_owned(),
+                    mount: Some("/run/media/user/photos".to_owned()),
+                    fstype: "exfat".to_owned(),
+                    mounted: true,
+                    size: "64 GB".to_owned(),
+                    encryption: drives::Encryption::Unencrypted,
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(terminal_width, 20)).unwrap();
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width.into())
+            .map(|line| line.iter().map(ratatui::buffer::Cell::symbol).collect())
+            .find(|line: &String| line.starts_with("│ >"))
+            .unwrap()
+    }
+
+    fn column(row: &str, text: &str) -> usize {
+        row.find(text).expect(text)
+    }
+
+    // The user identifies a device by its label and fstype, and the full mount path must stay visible.
+    #[test]
+    fn row_shows_fstype_between_label_and_full_mount_path() {
+        let row = render_row("/dev/sda1", 100);
+        assert!(column(&row, "photos") < column(&row, "exfat"));
+        assert!(column(&row, "exfat") < column(&row, "/run/media/user/photos"));
+    }
+
+    // The free width goes to all columns, in proportion to the length of their content.
+    // A short label must not get as much width as a long mount path.
+    #[test]
+    fn free_width_follows_content_length() {
+        let row = render_row("/dev/sda1", 100);
+        let dev_width = column(&row, "photos") - column(&row, "/dev/sda1");
+        let label_width = column(&row, "exfat") - column(&row, "photos");
+        let mount_width = column(&row, "64 GB") - column(&row, "/run/media/user/photos");
+        assert!(dev_width > "/dev/sda1 ".len());
+        assert!(label_width < dev_width);
+        assert!(dev_width < mount_width);
+    }
+
+    // Network mounts (sshfs, NFS) have long dev names.
+    // The other columns must stay visible, mainly the mount path, because `l` goes to it.
+    #[test]
+    fn long_dev_name_does_not_hide_other_columns() {
+        let row = render_row("user@fileserver.example.com:/srv/share", 80);
+        assert!(column(&row, "photos") < column(&row, "exfat"));
+        assert!(column(&row, "exfat") < column(&row, "/run/media/user/photos"));
+    }
+
     fn block(object_path: &str, dev: &str, mount: Option<&str>) -> drives::Block {
         drives::Block {
             object_path: object_path.to_owned(),
@@ -207,6 +408,7 @@ mod tests {
             fstype: String::new(),
             mounted: mount.is_some(),
             size: String::new(),
+            encryption: drives::Encryption::Unencrypted,
         }
     }
 
