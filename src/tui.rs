@@ -138,14 +138,16 @@ impl Tui {
                 }
                 InputResult::None
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | 'o') => {
-                if let Some(s) = &self.selected {
-                    let output = s.clone().mount.unwrap_or_default();
-                    InputResult::QuitChangeDirectory(output)
-                } else {
-                    InputResult::Quit
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | 'o') => match &self.selected {
+                Some(s) if s.mounted => {
+                    InputResult::QuitChangeDirectory(s.mount.clone().unwrap_or_default())
                 }
-            }
+                Some(_) => {
+                    self.last_status = String::from("Error: not mounted");
+                    InputResult::None
+                }
+                None => InputResult::Quit,
+            },
             KeyCode::Esc | KeyCode::Char('q') => InputResult::Quit,
             _ => InputResult::None,
         }
@@ -596,6 +598,25 @@ mod tests {
         show(&mut tui, vec![udisks_block("/dev/sda1", Some("/mnt/a"))]);
         let result = tui.input(KeyCode::Right.into());
         assert!(matches!(result, InputResult::QuitChangeDirectory(path) if path == "/mnt/a"));
+    }
+
+    // A row that is not mounted has no mount path (udisks), or a path where nothing is mounted (fstab).
+    // `l` must not quit to that path. The user must see why nothing happens.
+    #[test]
+    fn cd_on_row_that_is_not_mounted_shows_why() {
+        let not_mounted_fstab_line = drives::Block {
+            mounted: false,
+            ..fstab_block("UUID=1234", "/mnt/data")
+        };
+        for row in [udisks_block("/dev/sdc1", None), not_mounted_fstab_line] {
+            let mut tui = Tui::default();
+            show(&mut tui, vec![row]);
+            assert!(matches!(
+                tui.input(KeyCode::Char('l').into()),
+                InputResult::None
+            ));
+            assert_eq!(tui.last_status, "Error: not mounted");
+        }
     }
 
     // udisks names the mount directory of a filesystem without a label by its UUID, so the path is long.
