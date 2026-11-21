@@ -34,6 +34,7 @@ struct PassphrasePrompt {
 
 const HELP: &str = "j/▼⋮k/▲⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
 const PROMPT_HELP: &str = "Enter - Unlock⋮Esc - Cancel";
+const MAX_MOUNT_TEXT_LENGTH: usize = 30;
 
 impl Tui {
     pub fn update(&mut self, scan: &Result<Vec<drives::Drive>, String>) {
@@ -174,27 +175,27 @@ impl Tui {
             .and_then(|n| rows.get(n).cloned())
             .clone_into(&mut self.selected);
 
-        let max_field_length = |field: fn(&drives::Block) -> &str| -> u16 {
+        let max_field_length = |field_length: fn(&drives::Block) -> usize| -> u16 {
             rows.iter()
-                .map(|r| field(r).len())
+                .map(field_length)
                 .max()
                 .unwrap_or(0)
                 .try_into()
                 .unwrap_or(0)
         };
         let table_area = block.inner(layout[0]);
-        let max_dev_field_length = max_field_length(|r| &r.dev);
-        let max_label_field_length = max_field_length(|r| &r.label);
-        let max_fstype_field_length = max_field_length(|r| &r.fstype);
-        let max_mount_field_length = max_field_length(|r| r.mount.as_deref().unwrap_or_default());
-        let max_size_field_length = max_field_length(|r| &r.size);
+        let max_dev_field_length = max_field_length(|r| r.dev.len());
+        let max_label_field_length = max_field_length(|r| r.label.len());
+        let max_fstype_field_length = max_field_length(|r| r.fstype.len());
+        let max_mount_field_length = max_field_length(|r| short_mount_path(r).chars().count());
+        let max_size_field_length = max_field_length(|r| r.size.len());
 
         let rows = rows.iter().map(|i| {
             Row::new(vec![
                 i.dev.clone(),
                 i.label.clone(),
                 i.fstype.clone(),
-                i.mount.clone().unwrap_or_default(),
+                short_mount_path(i),
                 i.size.clone(),
                 if i.mounted {
                     "M".to_owned()
@@ -266,6 +267,15 @@ impl Tui {
             frame.render_widget(Paragraph::new(hidden_passphrase).block(block), area);
         }
     }
+}
+
+fn short_mount_path(block: &drives::Block) -> String {
+    let path = block.mount.as_deref().unwrap_or_default();
+    if path.chars().count() <= MAX_MOUNT_TEXT_LENGTH {
+        return path.to_owned();
+    }
+    let start: String = path.chars().take(MAX_MOUNT_TEXT_LENGTH - 1).collect();
+    format!("{start}…")
 }
 
 fn same_device(first: &drives::Block, second: &drives::Block) -> bool {
@@ -354,7 +364,7 @@ mod tests {
         ));
     }
 
-    fn render_row(dev: &str, terminal_width: u16) -> String {
+    fn render_row(dev: &str, mount: &str, terminal_width: u16) -> String {
         let mut tui = Tui {
             drv: vec![drives::Drive {
                 id: String::new(),
@@ -366,7 +376,7 @@ mod tests {
                     drive_path: "/drive".to_owned(),
                     dev: dev.to_owned(),
                     label: "photos".to_owned(),
-                    mount: Some("/run/media/user/photos".to_owned()),
+                    mount: Some(mount.to_owned()),
                     fstype: "exfat".to_owned(),
                     mounted: true,
                     size: "64 GB".to_owned(),
@@ -391,10 +401,11 @@ mod tests {
         row.find(text).expect(text)
     }
 
-    // The user identifies a device by its label and fstype, and the full mount path must stay visible.
+    // The user identifies a device by its label and fstype.
+    // A mount path of up to 30 characters must stay visible in full.
     #[test]
     fn row_shows_fstype_between_label_and_full_mount_path() {
-        let row = render_row("/dev/sda1", 100);
+        let row = render_row("/dev/sda1", "/run/media/user/photos", 100);
         assert!(column(&row, "photos") < column(&row, "exfat"));
         assert!(column(&row, "exfat") < column(&row, "/run/media/user/photos"));
     }
@@ -403,7 +414,7 @@ mod tests {
     // A short label must not get as much width as a long mount path.
     #[test]
     fn free_width_follows_content_length() {
-        let row = render_row("/dev/sda1", 100);
+        let row = render_row("/dev/sda1", "/run/media/user/photos", 100);
         let dev_width = column(&row, "photos") - column(&row, "/dev/sda1");
         let label_width = column(&row, "exfat") - column(&row, "photos");
         let mount_width = column(&row, "64 GB") - column(&row, "/run/media/user/photos");
@@ -416,9 +427,27 @@ mod tests {
     // The other columns must stay visible, mainly the mount path, because `l` goes to it.
     #[test]
     fn long_dev_name_does_not_hide_other_columns() {
-        let row = render_row("user@fileserver.example.com:/srv/share", 80);
+        let row = render_row(
+            "user@fileserver.example.com:/srv/share",
+            "/run/media/user/photos",
+            80,
+        );
         assert!(column(&row, "photos") < column(&row, "exfat"));
         assert!(column(&row, "exfat") < column(&row, "/run/media/user/photos"));
+    }
+
+    // The mount column gets its width from the text in the table, not from the full path.
+    // Else a long path still takes the width from the other columns, and they move when it gets mounted.
+    #[test]
+    fn mount_column_width_follows_short_text() {
+        let uuid_path = "/run/media/user/d06c58e9-6860-4a35-a0c0-acd309f8854e";
+        let long_path_row = render_row("/dev/sda1", uuid_path, 100);
+        let path_of_30_characters_row =
+            render_row("/dev/sda1", "/run/media/user/d06c58e9-68601", 100);
+        assert_eq!(
+            column(&long_path_row, "exfat"),
+            column(&path_of_30_characters_row, "exfat")
+        );
     }
 
     fn block(object_path: &str, dev: &str, mount: Option<&str>) -> drives::Block {
@@ -558,6 +587,25 @@ mod tests {
         show(&mut tui, vec![udisks_block("/dev/sda1", Some("/mnt/a"))]);
         let result = tui.input(KeyCode::Right.into());
         assert!(matches!(result, InputResult::QuitChangeDirectory(path) if path == "/mnt/a"));
+    }
+
+    // udisks names the mount directory of a filesystem without a label by its UUID, so the path is long.
+    // The table shows only the start of a long path, but `l` must still go to the full path.
+    #[test]
+    fn long_mount_path_is_short_in_table_but_full_for_cd() {
+        let mut tui = Tui::default();
+        let uuid_path = "/run/media/user/d06c58e9-6860-4a35-a0c0-acd309f8854e";
+        show(&mut tui, vec![udisks_block("/dev/sdc1", Some(uuid_path))]);
+        assert!(draw(&mut tui).contains("/run/media/user/d06c58e9-6860…"));
+        let result = tui.input(KeyCode::Right.into());
+        assert!(matches!(result, InputResult::QuitChangeDirectory(path) if path == uuid_path));
+    }
+
+    // A label can have characters of more than one byte. A cut inside a character stops the program.
+    #[test]
+    fn long_mount_path_is_cut_between_characters() {
+        let block = udisks_block("/dev/sdc1", Some("/run/media/user/Фотографии отпуск 2024"));
+        assert_eq!(short_mount_path(&block), "/run/media/user/Фотографии от…");
     }
 
     // An unmount of a slow USB stick must first write its cache, and a LUKS unlock must derive the key.
