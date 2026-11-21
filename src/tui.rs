@@ -2,8 +2,8 @@ use crate::drives;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Alignment, Constraint, Flex, Layout},
-    style::Color,
-    text::Line,
+    style::{Color, Stylize},
+    text::{Line, Span},
     widgets::{Block, BorderType, Clear, Padding, Paragraph, Row, Table, TableState, Widget, Wrap},
     Frame,
 };
@@ -32,7 +32,15 @@ struct PassphrasePrompt {
     passphrase: String,
 }
 
-const HELP: &str = "j/▼⋮k/▲⋮l/o/▶ - CD⋮m - Mount⋮u - Unmount⋮e - Eject⋮q - Quit";
+const HELP: [(&str, &str); 7] = [
+    ("j/↓", "down"),
+    ("k/↑", "up"),
+    ("l/→", "cd"),
+    ("m", "mount"),
+    ("u", "unmount"),
+    ("e", "eject"),
+    ("q", "quit"),
+];
 const PROMPT_HELP: &str = "Enter - Unlock⋮Esc - Cancel";
 const MAX_MOUNT_TEXT_LENGTH: usize = 30;
 
@@ -253,14 +261,26 @@ impl Tui {
             Some(error) => format!("Error: {error}"),
             None => self.last_status.clone(),
         };
-        let info = format!("{status} | {HELP}\n{descr}");
-        let info = Paragraph::new(info).wrap(Wrap { trim: true });
+        let info = Paragraph::new(vec![Line::from(status), help_line(), Line::from(descr)])
+            .wrap(Wrap { trim: true });
         frame.render_widget(info, layout[1]);
 
         if let Some(prompt) = &self.passphrase_prompt {
             draw_passphrase_prompt(frame, prompt);
         }
     }
+}
+
+fn help_line() -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (keys, action)) in HELP.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(keys.yellow().bold());
+        spans.push(Span::raw(format!(" {action}")));
+    }
+    Line::from(spans)
 }
 
 fn draw_passphrase_prompt(frame: &mut Frame, prompt: &PassphrasePrompt) {
@@ -305,6 +325,7 @@ fn same_device(first: &drives::Block, second: &drives::Block) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::oneshot;
 
@@ -595,7 +616,34 @@ mod tests {
         assert!(!draw(&mut tui).contains("Error"));
     }
 
-    // The help line shows ▶ for CD.
+    // The help must be easy to read: it has its own line, not after the status,
+    // and the keys have a different style from the actions.
+    #[test]
+    fn help_has_own_line_and_marked_keys() {
+        let mut tui = Tui {
+            last_status: "Error: The operation failed".to_owned(),
+            ..Tui::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let help_row = (0..buffer.area.height)
+            .find(|&row| {
+                let line: String = (0..8)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                line == "j/↓ down"
+            })
+            .expect("no line starts with the help");
+        let key = &buffer[(0, help_row)];
+        let action = &buffer[(4, help_row)];
+        assert_eq!(key.fg, Color::Yellow);
+        assert!(key.modifier.contains(Modifier::BOLD));
+        assert_ne!(action.fg, Color::Yellow);
+        assert!(!action.modifier.contains(Modifier::BOLD));
+    }
+
+    // The help line shows → for CD.
     #[test]
     fn right_key_changes_directory() {
         let mut tui = Tui::default();
