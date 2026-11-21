@@ -41,6 +41,7 @@ async fn main() -> udisks2::Result<()> {
     let mut tui = Tui::default();
     loop {
         tui.update(&*state.lock().await);
+        tui.finish_operation().await;
         terminal
             .draw(|f| tui.draw(f))
             .expect("failed to draw frame");
@@ -51,7 +52,7 @@ async fn main() -> udisks2::Result<()> {
         };
 
         if key.kind == KeyEventKind::Press {
-            match tui.input(key).await {
+            match tui.input(key) {
                 InputResult::None => {}
                 InputResult::Quit => break,
                 InputResult::QuitChangeDirectory(p) => {

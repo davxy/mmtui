@@ -7,6 +7,8 @@ use ratatui::{
     widgets::{Block, BorderType, Clear, Padding, Paragraph, Row, Table, TableState, Widget, Wrap},
     Frame,
 };
+use std::future::Future;
+use tokio::task::JoinHandle;
 
 pub enum InputResult {
     None,
@@ -22,6 +24,7 @@ pub struct Tui {
     pub last_status: String,
     scan_error: Option<String>,
     passphrase_prompt: Option<PassphrasePrompt>,
+    operation: Option<JoinHandle<udisks2::Result<()>>>,
 }
 
 struct PassphrasePrompt {
@@ -50,7 +53,25 @@ impl Tui {
         }
     }
 
-    pub async fn input(&mut self, key: KeyEvent) -> InputResult {
+    fn start(
+        &mut self,
+        progress: &str,
+        operation: impl Future<Output = udisks2::Result<()>> + Send + 'static,
+    ) {
+        progress.clone_into(&mut self.last_status);
+        self.operation = Some(tokio::spawn(operation));
+    }
+
+    pub async fn finish_operation(&mut self) {
+        if let Some(operation) = self.operation.take_if(|operation| operation.is_finished()) {
+            match operation.await {
+                Ok(result) => self.set_status(result),
+                Err(error) => self.last_status = format!("Error: {error}"),
+            }
+        }
+    }
+
+    pub fn input(&mut self, key: KeyEvent) -> InputResult {
         if let Some(prompt) = &mut self.passphrase_prompt {
             match key.code {
                 KeyCode::Char(character) => prompt.passphrase.push(character),
@@ -60,9 +81,9 @@ impl Tui {
                 KeyCode::Esc => self.passphrase_prompt = None,
                 KeyCode::Enter => {
                     if let Some(prompt) = self.passphrase_prompt.take() {
-                        self.set_status(
-                            drives::unlock_and_mount(&prompt.block, &prompt.passphrase).await,
-                        );
+                        self.start("Unlocking...", async move {
+                            drives::unlock_and_mount(&prompt.block, &prompt.passphrase).await
+                        });
                     }
                 }
                 _ => {}
@@ -81,28 +102,29 @@ impl Tui {
                 self.selected = None;
                 InputResult::None
             }
+            KeyCode::Char('m' | 'u' | 'e') if self.operation.is_some() => InputResult::None,
             KeyCode::Char('m') => {
-                if let Some(b) = &self.selected {
+                if let Some(b) = self.selected.clone() {
                     if let drives::Encryption::Locked = b.encryption {
                         self.passphrase_prompt = Some(PassphrasePrompt {
-                            block: b.clone(),
+                            block: b,
                             passphrase: String::new(),
                         });
                     } else {
-                        self.set_status(drives::mount(b).await);
+                        self.start("Mounting...", async move { drives::mount(&b).await });
                     }
                 }
                 InputResult::None
             }
             KeyCode::Char('u') => {
-                if let Some(b) = &self.selected {
-                    self.set_status(drives::unmount(b).await);
+                if let Some(b) = self.selected.clone() {
+                    self.start("Unmounting...", async move { drives::unmount(&b).await });
                 }
                 InputResult::None
             }
             KeyCode::Char('e') => {
-                if let Some(b) = &self.selected {
-                    self.set_status(drives::eject(b).await);
+                if let Some(b) = self.selected.clone() {
+                    self.start("Ejecting...", async move { drives::eject(&b).await });
                 }
                 InputResult::None
             }
@@ -259,6 +281,7 @@ fn same_device(first: &drives::Block, second: &drives::Block) -> bool {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::oneshot;
 
     fn tui_with_locked_luks_row() -> Tui {
         let block = drives::Block {
@@ -278,22 +301,22 @@ mod tests {
         }
     }
 
-    async fn press(tui: &mut Tui, code: KeyCode) -> InputResult {
-        tui.input(KeyEvent::from(code)).await
+    fn press(tui: &mut Tui, code: KeyCode) -> InputResult {
+        tui.input(KeyEvent::from(code))
     }
 
-    async fn type_text(tui: &mut Tui, text: &str) {
+    fn type_text(tui: &mut Tui, text: &str) {
         for character in text.chars() {
-            press(tui, KeyCode::Char(character)).await;
+            press(tui, KeyCode::Char(character));
         }
     }
 
     // udisks cannot mount a locked device. `m` must ask for the passphrase of
     // the selected device and must not send a mount request.
-    #[tokio::test]
-    async fn mount_of_locked_device_asks_for_passphrase() {
+    #[test]
+    fn mount_of_locked_device_asks_for_passphrase() {
         let mut tui = tui_with_locked_luks_row();
-        press(&mut tui, KeyCode::Char('m')).await;
+        press(&mut tui, KeyCode::Char('m'));
         let prompt = tui.passphrase_prompt.expect("no passphrase prompt");
         assert_eq!(prompt.block.dev, "/dev/sdc2");
         assert_eq!(tui.last_status, "");
@@ -301,32 +324,32 @@ mod tests {
 
     // A passphrase can contain command keys, for example `q`. In the prompt
     // they must become passphrase text, and must not quit or start a command.
-    #[tokio::test]
-    async fn prompt_takes_command_keys_as_passphrase_text() {
+    #[test]
+    fn prompt_takes_command_keys_as_passphrase_text() {
         let mut tui = tui_with_locked_luks_row();
-        press(&mut tui, KeyCode::Char('m')).await;
+        press(&mut tui, KeyCode::Char('m'));
         for character in "qmuejkl".chars() {
-            let result = press(&mut tui, KeyCode::Char(character)).await;
+            let result = press(&mut tui, KeyCode::Char(character));
             assert!(matches!(result, InputResult::None));
         }
-        press(&mut tui, KeyCode::Backspace).await;
+        press(&mut tui, KeyCode::Backspace);
         let prompt = tui.passphrase_prompt.expect("prompt closed");
         assert_eq!(prompt.passphrase, "qmuejk");
     }
 
     // Esc must cancel: no unlock request (it sets a status), and the normal
     // keys work again.
-    #[tokio::test]
-    async fn escape_closes_prompt_without_unlock() {
+    #[test]
+    fn escape_closes_prompt_without_unlock() {
         let mut tui = tui_with_locked_luks_row();
-        press(&mut tui, KeyCode::Char('m')).await;
-        type_text(&mut tui, "secret").await;
-        let result = press(&mut tui, KeyCode::Esc).await;
+        press(&mut tui, KeyCode::Char('m'));
+        type_text(&mut tui, "secret");
+        let result = press(&mut tui, KeyCode::Esc);
         assert!(matches!(result, InputResult::None));
         assert!(tui.passphrase_prompt.is_none());
         assert_eq!(tui.last_status, "");
         assert!(matches!(
-            press(&mut tui, KeyCode::Char('q')).await,
+            press(&mut tui, KeyCode::Char('q')),
             InputResult::Quit
         ));
     }
@@ -458,15 +481,15 @@ mod tests {
 
     // A device can appear while the user looks at the list. `m`, `u` and `e` act on the selected row,
     // so the cursor must stay on the device that the user selected, also when that device gets mounted.
-    #[tokio::test]
-    async fn selection_stays_on_device_when_rows_move() {
+    #[test]
+    fn selection_stays_on_device_when_rows_move() {
         let mut tui = Tui::default();
         let rows = vec![
             udisks_block("/dev/sdb1", None),
             udisks_block("/dev/sdc1", None),
         ];
         show(&mut tui, rows.clone());
-        tui.input(KeyCode::Down.into()).await;
+        tui.input(KeyCode::Down.into());
         show(&mut tui, rows);
 
         let new_device = udisks_block("/dev/sda1", None);
@@ -480,30 +503,30 @@ mod tests {
     }
 
     // The cursor follows the device from one frame to the next, but a key must still move it.
-    #[tokio::test]
-    async fn down_key_moves_to_next_device() {
+    #[test]
+    fn down_key_moves_to_next_device() {
         let mut tui = Tui::default();
         let blocks = vec![
             udisks_block("/dev/sda1", None),
             udisks_block("/dev/sdb1", None),
         ];
         show(&mut tui, blocks.clone());
-        tui.input(KeyCode::Down.into()).await;
+        tui.input(KeyCode::Down.into());
         show(&mut tui, blocks);
         assert_eq!(selected(&tui).dev, "/dev/sdb1");
     }
 
     // fstab can have many lines with the same dev, for example btrfs subvolumes.
     // These rows have no udisks object path, so only the mount path tells them apart.
-    #[tokio::test]
-    async fn fstab_rows_with_same_dev_stay_apart() {
+    #[test]
+    fn fstab_rows_with_same_dev_stay_apart() {
         let mut tui = Tui::default();
         let subvolumes = vec![
             fstab_block("UUID=1234", "/home"),
             fstab_block("UUID=1234", "/var/log"),
         ];
         show(&mut tui, subvolumes.clone());
-        tui.input(KeyCode::Down.into()).await;
+        tui.input(KeyCode::Down.into());
         show(&mut tui, subvolumes.clone());
 
         show(
@@ -529,11 +552,55 @@ mod tests {
     }
 
     // The help line shows ▶ for CD.
-    #[tokio::test]
-    async fn right_key_changes_directory() {
+    #[test]
+    fn right_key_changes_directory() {
         let mut tui = Tui::default();
         show(&mut tui, vec![udisks_block("/dev/sda1", Some("/mnt/a"))]);
-        let result = tui.input(KeyCode::Right.into()).await;
+        let result = tui.input(KeyCode::Right.into());
         assert!(matches!(result, InputResult::QuitChangeDirectory(path) if path == "/mnt/a"));
+    }
+
+    // An unmount of a slow USB stick must first write its cache, and a LUKS unlock must derive the key.
+    // During that time the user must see that the operation runs, and the keys must still work.
+    #[tokio::test]
+    async fn screen_and_keys_work_while_operation_runs() {
+        let mut tui = Tui::default();
+        let rows = vec![
+            udisks_block("/dev/sda1", None),
+            udisks_block("/dev/sdb1", None),
+        ];
+        show(&mut tui, rows.clone());
+        let (end_operation, operation_ended) = oneshot::channel();
+        tui.start("Unmounting...", async { operation_ended.await.unwrap() });
+
+        tui.input(KeyCode::Down.into());
+        show(&mut tui, rows);
+        assert_eq!(selected(&tui).dev, "/dev/sdb1");
+        assert!(draw(&mut tui).contains("Unmounting..."));
+
+        end_operation.send(Err(udisks2::Error::Failed)).unwrap();
+        tokio::task::yield_now().await;
+        tui.finish_operation().await;
+        assert!(draw(&mut tui).contains("Error: Failed"));
+    }
+
+    // A second operation would replace the result of the first in the status line, and the user could miss an error.
+    // A udisks call can hang (a polkit password request that the terminal does not show), so `q` must still work.
+    #[tokio::test]
+    async fn mount_keys_do_nothing_but_quit_works_while_operation_runs() {
+        let mut tui = Tui::default();
+        let fake_device = "/org/freedesktop/UDisks2/block_devices/mmtui_test";
+        show(&mut tui, vec![block(fake_device, "/dev/mmtui_test", None)]);
+        let (_end_operation, operation_ended) = oneshot::channel();
+        tui.start("Unmounting...", async { operation_ended.await.unwrap() });
+
+        for key in ['m', 'u', 'e'] {
+            tui.input(KeyCode::Char(key).into());
+            assert_eq!(tui.last_status, "Unmounting...");
+        }
+        assert!(matches!(
+            tui.input(KeyCode::Char('q').into()),
+            InputResult::Quit
+        ));
     }
 }
