@@ -18,6 +18,15 @@ use tui::{InputResult, Tui};
 #[tokio::main]
 async fn main() -> udisks2::Result<()> {
     let config = Config::load_or_default();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // tokio catches a panic in a task, and mmtui keeps running.
+        if std::thread::current().name() == Some("main") {
+            let _ = disable_raw_mode();
+            let _ = execute!(stderr(), LeaveAlternateScreen);
+        }
+        default_hook(info);
+    }));
     enable_raw_mode().unwrap();
     execute!(stderr(), EnterAlternateScreen).unwrap();
     let mut terminal = Terminal::new(CrosstermBackend::new(stderr())).unwrap();
