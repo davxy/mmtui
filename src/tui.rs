@@ -104,6 +104,15 @@ impl Tui {
                 InputResult::None
             }
             KeyCode::Char('m' | 'u' | 'e') if self.operation.is_some() => InputResult::None,
+            KeyCode::Char('m' | 'u' | 'e')
+                if self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|block| block.object_path.is_empty()) =>
+            {
+                self.last_status = String::from("Error: not a udisks device");
+                InputResult::None
+            }
             KeyCode::Char('m') => {
                 if let Some(b) = self.selected.clone() {
                     if let drives::Encryption::Locked = b.encryption {
@@ -650,6 +659,19 @@ mod tests {
             tui.input(KeyCode::Char('q').into()),
             InputResult::Quit
         ));
+    }
+
+    // Rows from /proc/self/mounts and fstab (FUSE and network mounts, fstab lines) have no udisks object.
+    // A udisks call on them fails with a parse error that does not tell the user why.
+    #[tokio::test]
+    async fn mount_keys_on_row_that_udisks_does_not_know_show_why() {
+        let mut tui = Tui::default();
+        show(&mut tui, vec![fstab_block("UUID=1234", "/mnt/data")]);
+        for key in ['m', 'u', 'e'] {
+            tui.input(KeyCode::Char(key).into());
+            assert_eq!(tui.last_status, "Error: not a udisks device");
+            assert!(tui.operation.is_none());
+        }
     }
 
     // The status line must show the text of an error, not its debug structure.
