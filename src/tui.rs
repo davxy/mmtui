@@ -81,6 +81,9 @@ impl Tui {
     }
 
     pub fn input(&mut self, key: KeyEvent) -> InputResult {
+        if self.operation.is_none() {
+            self.last_status.clear();
+        }
         if let Some(prompt) = &mut self.passphrase_prompt {
             match key.code {
                 KeyCode::Char(character) => prompt.passphrase.push(character),
@@ -614,6 +617,18 @@ mod tests {
 
         tui.update(&good_scan);
         assert!(!draw(&mut tui).contains("Error"));
+    }
+
+    // A message is the result of the last action. If it stays after the next key,
+    // an old error looks like the result of the new action.
+    #[test]
+    fn key_clears_old_message() {
+        let mut tui = Tui {
+            last_status: "Error: not mounted".to_owned(),
+            ..Tui::default()
+        };
+        tui.input(KeyCode::Down.into());
+        assert_eq!(tui.last_status, "");
     }
 
     // The help must be easy to read: it has its own line, not after the status,
