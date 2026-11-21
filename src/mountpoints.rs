@@ -1,5 +1,4 @@
 use crate::config::Config;
-use std::{io::BufRead, path::PathBuf};
 
 #[derive(Debug)]
 pub struct MountPoint {
@@ -11,12 +10,11 @@ pub struct MountPoint {
 
 impl MountPoint {
     pub fn collect_from_file(path: &str, config: &Config) -> Vec<MountPoint> {
-        let Ok(file) = std::fs::File::open(PathBuf::from(path)) else {
+        let Ok(content) = std::fs::read(path) else {
             return Vec::new();
         };
-        std::io::BufReader::new(file)
+        String::from_utf8_lossy(&content)
             .lines()
-            .map_while(Result::ok)
             .filter_map(|l| {
                 let mut parts = l.split_whitespace();
                 Some(MountPoint {
@@ -91,7 +89,7 @@ fn octal_escape(bytes: &[u8]) -> Option<u8> {
 mod tests {
     use super::*;
 
-    fn collect_from_text(name: &str, text: &str) -> Vec<MountPoint> {
+    fn collect_from_text(name: &str, text: impl AsRef<[u8]>) -> Vec<MountPoint> {
         let file = std::env::temp_dir().join(format!("mmtui-{}-{name}", std::process::id()));
         std::fs::write(&file, text).unwrap();
         let mounts = MountPoint::collect_from_file(file.to_str().unwrap(), &Config::default());
@@ -124,6 +122,18 @@ mod tests {
             "/dev/sdd1 /mnt/a\\777b\\08c\\+12\\ ext4 rw 0 0\n",
         );
         assert_eq!(mounts[0].path.as_deref(), Some("/mnt/a\\777b\\08c\\+12\\"));
+    }
+
+    // The kernel escapes only space, tab, new line and backslash, and writes all other path bytes as they are.
+    // A path that is not valid UTF-8 (for example Latin-1 from an old disk) must not hide the next mount points.
+    #[test]
+    fn line_that_is_not_utf8_does_not_hide_next_lines() {
+        let mounts = collect_from_text(
+            "not-utf8",
+            b"/dev/sdc1 /mnt/caf\xe9 vfat rw 0 0\n/dev/sdd1 /mnt/data ext4 rw 0 0\n",
+        );
+        let paths: Vec<_> = mounts.iter().map(|mount| mount.path.as_deref()).collect();
+        assert_eq!(paths, [Some("/mnt/caf\u{FFFD}"), Some("/mnt/data")]);
     }
 
     // /etc/fstab is optional. A panic here stops the scan task, and the table never changes again.
