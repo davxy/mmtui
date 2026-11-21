@@ -50,7 +50,7 @@ impl Tui {
     fn set_status(&mut self, res: udisks2::Result<()>) {
         self.last_status = match res {
             Ok(()) => String::from("Ok"),
-            Err(e) => format!("Error: {e:?}"),
+            Err(e) => format!("Error: {e}"),
         }
     }
 
@@ -629,7 +629,7 @@ mod tests {
         end_operation.send(Err(udisks2::Error::Failed)).unwrap();
         tokio::task::yield_now().await;
         tui.finish_operation().await;
-        assert!(draw(&mut tui).contains("Error: Failed"));
+        assert!(draw(&mut tui).contains("Error: The operation failed"));
     }
 
     // A second operation would replace the result of the first in the status line, and the user could miss an error.
@@ -650,5 +650,14 @@ mod tests {
             tui.input(KeyCode::Char('q').into()),
             InputResult::Quit
         ));
+    }
+
+    // The status line must show the text of an error, not its debug structure.
+    #[test]
+    fn status_shows_text_of_error() {
+        let mut tui = Tui::default();
+        let error = udisks2::Error::Zbus(udisks2::zbus::Error::InterfaceNotFound);
+        tui.set_status(Err(error));
+        assert_eq!(tui.last_status, "Error: Interface not found");
     }
 }
