@@ -1,6 +1,11 @@
-use crate::config::Config;
-use crate::mountpoints;
+use crate::{config::Config, mountpoints};
 use std::collections::HashMap;
+use tokio::sync::OnceCell;
+use udisks2::zbus::{
+    fdo::ManagedObjects,
+    names::OwnedInterfaceName,
+    zvariant::{OwnedObjectPath, OwnedValue},
+};
 
 #[derive(Debug, Clone)]
 pub enum Encryption {
@@ -38,10 +43,8 @@ impl Block {
 
 #[derive(Debug, Clone)]
 pub struct Drive {
-    pub id: String,
     pub object_path: String,
     pub model: String,
-    pub ejectable: bool,
     pub blocks: Vec<Block>,
 }
 
@@ -52,98 +55,116 @@ fn device_name(bytes: &[u8]) -> String {
         .collect()
 }
 
-async fn encryption_of(
-    client: &udisks2::Client,
-    object: &udisks2::Object,
-) -> udisks2::Result<Encryption> {
-    let Ok(encrypted) = object.encrypted().await else {
-        return Ok(Encryption::Unencrypted);
-    };
-    let cleartext_path = encrypted.cleartext_device().await?.to_string();
-    if cleartext_path == "/" {
-        return Ok(Encryption::Locked);
+const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
+const BLOCK: &str = "org.freedesktop.UDisks2.Block";
+const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
+
+type Interfaces = HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>;
+
+static CLIENT: OnceCell<udisks2::Client> = OnceCell::const_new();
+
+async fn shared_client() -> udisks2::Result<&'static udisks2::Client> {
+    CLIENT.get_or_try_init(udisks2::Client::new).await
+}
+
+fn property<T: TryFrom<OwnedValue>>(
+    interfaces: &Interfaces,
+    interface: &str,
+    name: &str,
+) -> Option<T> {
+    let value = interfaces.get(interface)?.get(name)?.try_clone().ok()?;
+    T::try_from(value).ok()
+}
+
+fn encryption_of(objects: &ManagedObjects, interfaces: &Interfaces) -> Option<Encryption> {
+    if !interfaces.contains_key(ENCRYPTED) {
+        return Some(Encryption::Unencrypted);
     }
-    let cleartext = client.object(cleartext_path.clone())?.block().await?;
-    Ok(Encryption::Unlocked(Cleartext {
-        object_path: cleartext_path,
+    let cleartext_path: OwnedObjectPath = property(interfaces, ENCRYPTED, "CleartextDevice")?;
+    if cleartext_path.as_str() == "/" {
+        return Some(Encryption::Locked);
+    }
+    let cleartext = objects.get(&cleartext_path)?;
+    Some(Encryption::Unlocked(Cleartext {
+        object_path: cleartext_path.to_string(),
         devices: vec![
-            device_name(&cleartext.device().await?),
-            device_name(&cleartext.preferred_device().await?),
+            device_name(&property::<Vec<u8>>(cleartext, BLOCK, "Device")?),
+            device_name(&property::<Vec<u8>>(cleartext, BLOCK, "PreferredDevice")?),
         ],
     }))
 }
 
+fn drive_from(path: &OwnedObjectPath, interfaces: &Interfaces) -> Option<Drive> {
+    Some(Drive {
+        object_path: path.to_string(),
+        model: property(interfaces, DRIVE, "Model")?,
+        blocks: Vec::new(),
+    })
+}
+
+fn block_from(
+    objects: &ManagedObjects,
+    path: &OwnedObjectPath,
+    interfaces: &Interfaces,
+    size_text: impl Fn(u64) -> String,
+) -> Option<Block> {
+    let crypto_backing_device: OwnedObjectPath =
+        property(interfaces, BLOCK, "CryptoBackingDevice")?;
+    if crypto_backing_device.as_str() != "/" {
+        return None;
+    }
+    Some(Block {
+        object_path: path.to_string(),
+        drive_path: property::<OwnedObjectPath>(interfaces, BLOCK, "Drive")?.to_string(),
+        dev: device_name(&property::<Vec<u8>>(interfaces, BLOCK, "Device")?),
+        label: property(interfaces, BLOCK, "IdLabel")?,
+        mount: None,
+        fstype: property(interfaces, BLOCK, "IdType")?,
+        mounted: false,
+        size: property(interfaces, BLOCK, "Size")
+            .map(size_text)
+            .unwrap_or_default(),
+        encryption: encryption_of(objects, interfaces)?,
+    })
+}
+
+fn drives_from_objects(objects: &ManagedObjects, size_text: impl Fn(u64) -> String) -> Vec<Drive> {
+    let mut drives: Vec<Drive> = objects
+        .iter()
+        .filter_map(|(path, interfaces)| drive_from(path, interfaces))
+        .collect();
+
+    for (path, interfaces) in objects {
+        let Some(block) = block_from(objects, path, interfaces, &size_text) else {
+            continue;
+        };
+        if let Some(drive) = drives
+            .iter_mut()
+            .find(|d| d.object_path == block.drive_path)
+        {
+            drive.blocks.push(block);
+        } else {
+            drives.push(Drive {
+                object_path: block.drive_path.clone(),
+                model: String::new(),
+                blocks: vec![block],
+            });
+        }
+    }
+
+    drives
+}
+
 pub async fn collect_drives_from_udisk() -> udisks2::Result<Vec<Drive>> {
-    let mut drives: Vec<Drive> = Vec::new();
-    let client = udisks2::Client::new().await?;
+    let client = shared_client().await?;
     let objects = client
         .object_manager()
         .get_managed_objects()
         .await
-        .into_iter()
-        .flatten()
-        .filter_map(|(object_path, _)| {
-            client
-                .object(object_path.clone())
-                .ok()
-                .map(|obj| (object_path, obj))
-        });
-
-    for (path, i) in objects {
-        let path = path.to_string();
-        if let Ok(drv) = i.drive().await {
-            let drv = Drive {
-                object_path: path,
-                id: drv.id().await?,
-                model: drv.model().await?,
-                ejectable: drv.ejectable().await?,
-                blocks: Vec::new(),
-            };
-
-            if let Some(d) = drives.iter_mut().find(|i| i.object_path == drv.object_path) {
-                d.model = drv.model;
-                d.ejectable = drv.ejectable;
-                d.id = drv.id;
-            } else {
-                drives.push(drv);
-            }
-        } else if let Ok(blk) = i.block().await {
-            if blk.crypto_backing_device().await?.as_str() != "/" {
-                continue;
-            }
-            let drv_path = blk.drive().await?.to_string();
-            let size = if let Ok(size) = blk.size().await {
-                client.size_for_display(size, true, false)
-            } else {
-                String::new()
-            };
-            let block = Block {
-                object_path: path,
-                drive_path: drv_path.clone(),
-                dev: device_name(&blk.device().await?),
-                label: blk.id_label().await?,
-                mount: None,
-                fstype: blk.id_type().await?,
-                mounted: false,
-                size,
-                encryption: encryption_of(&client, &i).await?,
-            };
-
-            if let Some(d) = drives.iter_mut().find(|i| i.object_path == drv_path) {
-                d.blocks.push(block);
-            } else {
-                drives.push(Drive {
-                    object_path: drv_path,
-                    id: String::new(),
-                    model: String::new(),
-                    ejectable: false,
-                    blocks: vec![block],
-                });
-            }
-        }
-    }
-
-    Ok(drives)
+        .unwrap_or_default();
+    Ok(drives_from_objects(&objects, |size| {
+        client.size_for_display(size, true, false)
+    }))
 }
 
 pub async fn collect_all(config: &Config) -> udisks2::Result<Vec<Drive>> {
@@ -154,10 +175,8 @@ pub async fn collect_all(config: &Config) -> udisks2::Result<Vec<Drive>> {
 
 fn merge_mounts(mut drives: Vec<Drive>, mounts: Vec<mountpoints::MountPoint>) -> Vec<Drive> {
     let mut fstab = Drive {
-        id: "fstab".to_owned(),
         object_path: "fstab".to_owned(),
-        model: "fstab".to_owned(),
-        ejectable: false,
+        model: String::new(),
         blocks: Vec::new(),
     };
 
@@ -197,7 +216,7 @@ fn merge_mounts(mut drives: Vec<Drive>, mounts: Vec<mountpoints::MountPoint>) ->
 }
 
 pub async fn mount(block: &Block) -> udisks2::Result<()> {
-    let client = udisks2::Client::new().await?;
+    let client = shared_client().await?;
     let filesystem_path = match &block.encryption {
         Encryption::Unlocked(cleartext) => cleartext.object_path.clone(),
         Encryption::Unencrypted | Encryption::Locked => block.object_path.clone(),
@@ -214,7 +233,7 @@ pub async fn mount(block: &Block) -> udisks2::Result<()> {
 }
 
 pub async fn unlock_and_mount(block: &Block, passphrase: &str) -> udisks2::Result<()> {
-    let client = udisks2::Client::new().await?;
+    let client = shared_client().await?;
 
     let cleartext_path = client
         .object(block.object_path.clone())?
@@ -233,7 +252,7 @@ pub async fn unlock_and_mount(block: &Block, passphrase: &str) -> udisks2::Resul
 }
 
 pub async fn unmount(block: &Block) -> udisks2::Result<()> {
-    let client = udisks2::Client::new().await?;
+    let client = shared_client().await?;
 
     if let Encryption::Unlocked(cleartext) = &block.encryption {
         if let Ok(filesystem) = client
@@ -265,7 +284,7 @@ pub async fn unmount(block: &Block) -> udisks2::Result<()> {
 }
 
 pub async fn eject(block: &Block) -> udisks2::Result<()> {
-    let client = udisks2::Client::new().await?;
+    let client = shared_client().await?;
 
     client
         .object(block.drive_path.clone())?
@@ -280,6 +299,7 @@ pub async fn eject(block: &Block) -> udisks2::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use udisks2::zbus::{names::InterfaceName, zvariant::Value};
 
     fn luks_block(encryption: Encryption) -> Block {
         Block {
@@ -325,10 +345,8 @@ mod tests {
 
     fn drive_with_block(dev: &str) -> Drive {
         Drive {
-            id: String::new(),
             object_path: "/org/freedesktop/UDisks2/drives/disk".to_owned(),
             model: String::new(),
-            ejectable: false,
             blocks: vec![Block {
                 dev: dev.to_owned(),
                 fstype: "btrfs".to_owned(),
@@ -380,5 +398,151 @@ mod tests {
         let block = block_of(&drives, "/dev/sdb1");
         assert_eq!(block.mount.as_deref(), Some("/run/media/user/data"));
         assert!(block.mounted);
+    }
+
+    const DISK: &str = "/org/freedesktop/UDisks2/drives/disk";
+    const PARTITION: &str = "/org/freedesktop/UDisks2/block_devices/sdc2";
+    const CLEARTEXT: &str = "/org/freedesktop/UDisks2/block_devices/dm_2d0";
+    const LOOP: &str = "/org/freedesktop/UDisks2/block_devices/loop0";
+
+    fn value(value: impl Into<Value<'static>>) -> OwnedValue {
+        value.into().try_into().unwrap()
+    }
+
+    fn path_value(path: &str) -> OwnedValue {
+        value(OwnedObjectPath::try_from(path).unwrap())
+    }
+
+    fn device_value(dev: &str) -> OwnedValue {
+        value(format!("{dev}\0").into_bytes())
+    }
+
+    fn interfaces<const N: usize>(name: &str, properties: [(&str, OwnedValue); N]) -> Interfaces {
+        let properties = properties
+            .into_iter()
+            .map(|(property, value)| (property.to_owned(), value))
+            .collect();
+        HashMap::from([(InterfaceName::try_from(name).unwrap().into(), properties)])
+    }
+
+    fn drive_object(model: &str) -> Interfaces {
+        interfaces(DRIVE, [("Model", value(model.to_owned()))])
+    }
+
+    fn block_object(dev: &str, drive: &str) -> Interfaces {
+        interfaces(
+            BLOCK,
+            [
+                ("Device", device_value(dev)),
+                ("PreferredDevice", device_value(dev)),
+                ("Drive", path_value(drive)),
+                ("CryptoBackingDevice", path_value("/")),
+                ("IdLabel", value("data")),
+                ("IdType", value("ext4")),
+                ("Size", value(1024_u64)),
+            ],
+        )
+    }
+
+    fn encrypted(mut object: Interfaces, cleartext_device: &str) -> Interfaces {
+        object.extend(interfaces(
+            ENCRYPTED,
+            [("CleartextDevice", path_value(cleartext_device))],
+        ));
+        object
+    }
+
+    fn cleartext_object(crypto_backing_device: &str) -> Interfaces {
+        let mut object = block_object("/dev/dm-0", "/");
+        let block = object.get_mut(BLOCK).unwrap();
+        block.insert(
+            "PreferredDevice".to_owned(),
+            device_value("/dev/mapper/luks-1234"),
+        );
+        block.insert(
+            "CryptoBackingDevice".to_owned(),
+            path_value(crypto_backing_device),
+        );
+        object
+    }
+
+    fn scan(objects: Vec<(&str, Interfaces)>) -> Vec<Drive> {
+        let objects = objects
+            .into_iter()
+            .map(|(path, interfaces)| (OwnedObjectPath::try_from(path).unwrap(), interfaces))
+            .collect();
+        drives_from_objects(&objects, |size| format!("{size} B"))
+    }
+
+    // The scan builds all rows from one GetManagedObjects reply. Each column must come
+    // from its own udisks property, and udisks ends the Device bytes with a NUL.
+    // The model is a property of the drive object, not of the partition.
+    #[test]
+    fn scan_shows_partition_on_its_drive() {
+        let drives = scan(vec![
+            (DISK, drive_object("SanDisk 3.2Gen1")),
+            (PARTITION, block_object("/dev/sdc2", DISK)),
+        ]);
+        let [drive] = drives.as_slice() else {
+            panic!("expected one drive: {drives:?}")
+        };
+        assert_eq!(drive.object_path, DISK);
+        assert_eq!(drive.model, "SanDisk 3.2Gen1");
+        let [block] = drive.blocks.as_slice() else {
+            panic!("expected one row: {drive:?}")
+        };
+        assert_eq!(block.object_path, PARTITION);
+        assert_eq!(block.drive_path, DISK);
+        assert_eq!(block.dev, "/dev/sdc2");
+        assert_eq!(block.label, "data");
+        assert_eq!(block.fstype, "ext4");
+        assert_eq!(block.size, "1024 B");
+        assert!(matches!(block.encryption, Encryption::Unencrypted));
+    }
+
+    // udisks shows the cleartext device of an unlocked LUKS partition as a second block.
+    // It must not be a second row. The partition row needs the cleartext names,
+    // else a mount of the cleartext device does not join the row.
+    #[test]
+    fn unlocked_partition_is_one_row_with_cleartext_names() {
+        let drives = scan(vec![
+            (
+                PARTITION,
+                encrypted(block_object("/dev/sdc2", DISK), CLEARTEXT),
+            ),
+            (CLEARTEXT, cleartext_object(PARTITION)),
+        ]);
+        let rows: Vec<&Block> = drives.iter().flat_map(|drive| &drive.blocks).collect();
+        let [row] = rows.as_slice() else {
+            panic!("expected one row: {rows:?}")
+        };
+        assert_eq!(row.dev, "/dev/sdc2");
+        let Encryption::Unlocked(cleartext) = &row.encryption else {
+            panic!("expected an unlocked row: {row:?}")
+        };
+        assert_eq!(cleartext.object_path, CLEARTEXT);
+        assert_eq!(cleartext.devices, ["/dev/dm-0", "/dev/mapper/luks-1234"]);
+    }
+
+    // `m` asks for the passphrase only on a locked row.
+    // Without it, mmtui tries to mount the LUKS container and fails.
+    #[test]
+    fn luks_partition_without_cleartext_device_is_locked() {
+        let drives = scan(vec![(
+            PARTITION,
+            encrypted(block_object("/dev/sdc2", DISK), "/"),
+        )]);
+        assert!(matches!(drives[0].blocks[0].encryption, Encryption::Locked));
+    }
+
+    // Loop devices have no udisks drive (Drive is "/"). They must still show as rows.
+    #[test]
+    fn block_without_drive_shows_as_row() {
+        let drives = scan(vec![(LOOP, block_object("/dev/loop0", "/"))]);
+        let [drive] = drives.as_slice() else {
+            panic!("expected one drive: {drives:?}")
+        };
+        assert_eq!(drive.object_path, "/");
+        assert_eq!(drive.blocks[0].dev, "/dev/loop0");
     }
 }

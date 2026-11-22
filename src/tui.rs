@@ -164,6 +164,14 @@ impl Tui {
         }
     }
 
+    fn drive_model(&self, block: &drives::Block) -> Option<&str> {
+        self.drv
+            .iter()
+            .find(|drive| drive.object_path == block.drive_path)
+            .map(|drive| drive.model.as_str())
+            .filter(|model| !model.is_empty())
+    }
+
     pub fn draw(&mut self, frame: &mut Frame) {
         let layout = Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
@@ -251,9 +259,13 @@ impl Tui {
                 } else {
                     format!("not mounted {mnt_point:?}")
                 };
+                let model = match self.drive_model(s) {
+                    Some(model) => format!(" model: {model:?}"),
+                    None => String::new(),
+                };
 
                 format!(
-                    "dev: {:?} label: {:?} type: {:?} size {} {mounted}",
+                    "dev: {:?}{model} label: {:?} type: {:?} size {} {mounted}",
                     s.dev, s.label, s.fstype, s.size
                 )
             }
@@ -406,10 +418,8 @@ mod tests {
     fn render_row(dev: &str, mount: &str, terminal_width: u16) -> String {
         let mut tui = Tui {
             drv: vec![drives::Drive {
-                id: String::new(),
                 object_path: "/drive".to_owned(),
                 model: String::new(),
-                ejectable: false,
                 blocks: vec![drives::Block {
                     object_path: String::new(),
                     drive_path: "/drive".to_owned(),
@@ -514,11 +524,20 @@ mod tests {
 
     fn drive(blocks: Vec<drives::Block>) -> drives::Drive {
         drives::Drive {
-            id: String::new(),
             object_path: String::new(),
             model: String::new(),
-            ejectable: false,
             blocks,
+        }
+    }
+
+    fn drive_with_model(object_path: &str, model: &str, dev: &str) -> drives::Drive {
+        drives::Drive {
+            object_path: object_path.to_owned(),
+            model: model.to_owned(),
+            blocks: vec![drives::Block {
+                drive_path: object_path.to_owned(),
+                ..udisks_block(dev, None)
+            }],
         }
     }
 
@@ -602,6 +621,32 @@ mod tests {
             [vec![udisks_block("/dev/sda1", None)], subvolumes].concat(),
         );
         assert_eq!(selected(&tui).mount.as_deref(), Some("/var/log"));
+    }
+
+    // A device name such as /dev/sdc1 does not tell which disk or stick the row is.
+    // The info line must show the model of the drive of the selected row, not of another drive.
+    #[test]
+    fn info_line_shows_model_of_selected_drive() {
+        let mut tui = Tui {
+            drv: vec![
+                drive_with_model("/disk", "WDC WD30EFRX-68EUZN0", "/dev/sda1"),
+                drive_with_model("/stick", "SanDisk 3.2Gen1", "/dev/sdc1"),
+            ],
+            ..Tui::default()
+        };
+        draw(&mut tui);
+        tui.input(KeyCode::Down.into());
+        let screen = draw(&mut tui);
+        assert!(screen.contains(r#"model: "SanDisk 3.2Gen1""#), "{screen}");
+        assert!(!screen.contains("WDC"), "{screen}");
+    }
+
+    // Loop devices and fstab lines have no udisks drive. An empty model text is only noise.
+    #[test]
+    fn info_line_has_no_model_without_drive_model() {
+        let mut tui = Tui::default();
+        show(&mut tui, vec![fstab_block("UUID=1234", "/home")]);
+        assert!(!draw(&mut tui).contains("model"));
     }
 
     // udisks can stop or fail. The user must see why the list is empty or old.
