@@ -4,6 +4,7 @@ use std::vec::Vec;
 use xdg::BaseDirectories;
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub fstype_ignore: Vec<String>,
     pub path_ignore: Vec<String>,
@@ -58,5 +59,19 @@ impl Config {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A user writes only the option to change. If the file then fails to load, all of
+    // the user's options are lost. An omitted option must keep its built-in list.
+    #[test]
+    fn omitted_option_keeps_its_default() {
+        let config: Config = toml::from_str(r#"path_ignore = ["/mnt/backup"]"#).unwrap();
+        assert_eq!(config.path_ignore, ["/mnt/backup"]);
+        assert_eq!(config.fstype_ignore, Config::default().fstype_ignore);
     }
 }

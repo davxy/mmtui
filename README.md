@@ -30,7 +30,7 @@ mmtui supports an optional configuration file located at:
 
 `$XDG_CONFIG_HOME/mmtui/mmtui.toml`
 
-Given a relative path, mmtui searches `XDG_CONFIG_HOME` first and then `XDG_CONFIG_DIRS`, using the first existing configuration file found. If no configuration file found, built-in defaults are used. If a configuration file exists, it fully overrides the default configuration. The lookup is based on [freedesktop.org XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/).
+Given a relative path, mmtui searches `XDG_CONFIG_HOME` first and then `XDG_CONFIG_DIRS`, using the first existing configuration file found. If no configuration file found, built-in defaults are used. Each option in the configuration file replaces its built-in default. The lookup is based on [freedesktop.org XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/).
 
 The following shows the built-in default configuration used when no configuration file is present:
 ```toml
@@ -55,7 +55,7 @@ path_ignore =  [
 
 ### Options
 
-All options must be present in the configuration file. Options cannot be omitted; use an empty list if no entries are desired.
+All options are optional. An option that is not in the configuration file keeps its built-in default. Use an empty list to ignore nothing.
 
 * `fstype_ignore`
     List of filesystem types to ignore. Any mount whose filesystem type matches an entry in this list will be excluded.
