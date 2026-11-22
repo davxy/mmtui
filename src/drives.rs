@@ -58,6 +58,7 @@ fn device_name(bytes: &[u8]) -> String {
 const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
 const BLOCK: &str = "org.freedesktop.UDisks2.Block";
 const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
+const LOOP: &str = "org.freedesktop.UDisks2.Loop";
 
 type Interfaces = HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>;
 
@@ -102,6 +103,11 @@ fn drive_from(path: &OwnedObjectPath, interfaces: &Interfaces) -> Option<Drive> 
     })
 }
 
+fn is_free_loop(interfaces: &Interfaces) -> bool {
+    property::<Vec<u8>>(interfaces, LOOP, "BackingFile")
+        .is_some_and(|backing_file| matches!(backing_file.as_slice(), [] | [0]))
+}
+
 fn block_from(
     objects: &ManagedObjects,
     path: &OwnedObjectPath,
@@ -111,6 +117,9 @@ fn block_from(
     let crypto_backing_device: OwnedObjectPath =
         property(interfaces, BLOCK, "CryptoBackingDevice")?;
     if crypto_backing_device.as_str() != "/" {
+        return None;
+    }
+    if is_free_loop(interfaces) {
         return None;
     }
     Some(Block {
@@ -403,7 +412,8 @@ mod tests {
     const DISK: &str = "/org/freedesktop/UDisks2/drives/disk";
     const PARTITION: &str = "/org/freedesktop/UDisks2/block_devices/sdc2";
     const CLEARTEXT: &str = "/org/freedesktop/UDisks2/block_devices/dm_2d0";
-    const LOOP: &str = "/org/freedesktop/UDisks2/block_devices/loop0";
+    const LOOP0: &str = "/org/freedesktop/UDisks2/block_devices/loop0";
+    const LOOP1: &str = "/org/freedesktop/UDisks2/block_devices/loop1";
 
     fn value(value: impl Into<Value<'static>>) -> OwnedValue {
         value.into().try_into().unwrap()
@@ -463,6 +473,15 @@ mod tests {
             "CryptoBackingDevice".to_owned(),
             path_value(crypto_backing_device),
         );
+        object
+    }
+
+    fn loop_object(dev: &str, backing_file: &str) -> Interfaces {
+        let mut object = block_object(dev, "/");
+        object.extend(interfaces(
+            LOOP,
+            [("BackingFile", device_value(backing_file))],
+        ));
         object
     }
 
@@ -538,11 +557,27 @@ mod tests {
     // Loop devices have no udisks drive (Drive is "/"). They must still show as rows.
     #[test]
     fn block_without_drive_shows_as_row() {
-        let drives = scan(vec![(LOOP, block_object("/dev/loop0", "/"))]);
+        let drives = scan(vec![(LOOP0, block_object("/dev/loop0", "/"))]);
         let [drive] = drives.as_slice() else {
             panic!("expected one drive: {drives:?}")
         };
         assert_eq!(drive.object_path, "/");
         assert_eq!(drive.blocks[0].dev, "/dev/loop0");
+    }
+
+    // udisks lists a loop device also when it has no backing file. This free device has size 0
+    // and nothing to mount, so its row is only noise. A loop device with a file must still show.
+    #[test]
+    fn free_loop_device_is_not_a_row() {
+        let drives = scan(vec![
+            (LOOP0, loop_object("/dev/loop0", "")),
+            (LOOP1, loop_object("/dev/loop1", "/home/user/disk.img")),
+        ]);
+        let rows: Vec<&str> = drives
+            .iter()
+            .flat_map(|drive| &drive.blocks)
+            .map(|block| block.dev.as_str())
+            .collect();
+        assert_eq!(rows, ["/dev/loop1"]);
     }
 }
