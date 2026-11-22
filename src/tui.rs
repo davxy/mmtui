@@ -221,17 +221,17 @@ impl Tui {
         let max_size_field_length = max_field_length(|r| r.size.len());
 
         let rows = rows.iter().map(|i| {
+            let mount = short_mount_path(i);
             Row::new(vec![
-                i.dev.clone(),
-                i.label.clone(),
-                i.fstype.clone(),
-                short_mount_path(i),
-                i.size.clone(),
+                Span::raw(i.dev.clone()),
+                Span::raw(i.label.clone()),
+                Span::raw(i.fstype.clone()),
                 if i.mounted {
-                    "M".to_owned()
+                    Span::raw(mount)
                 } else {
-                    "O".to_owned()
+                    mount.dim()
                 },
+                Span::raw(i.size.clone()),
             ])
         });
         let widths = [
@@ -240,7 +240,6 @@ impl Tui {
             Constraint::Fill(max_fstype_field_length),
             Constraint::Fill(max_mount_field_length),
             Constraint::Length(max_size_field_length),
-            Constraint::Length(1),
         ];
         let table = Table::new(rows, widths)
             .row_highlight_style(Color::Green)
@@ -340,6 +339,7 @@ fn same_device(first: &drives::Block, second: &drives::Block) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::{Buffer, Cell};
     use ratatui::style::Modifier;
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::oneshot;
@@ -728,6 +728,59 @@ mod tests {
                 InputResult::None
             ));
             assert_eq!(tui.last_status, "Error: not mounted");
+        }
+    }
+
+    fn table_cell<'a>(buffer: &'a Buffer, text: &str) -> &'a Cell {
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(byte) = line.find(text).filter(|_| line.starts_with('│')) {
+                let x = u16::try_from(line[..byte].chars().count()).unwrap();
+                return &buffer[(x, y)];
+            }
+        }
+        panic!("no table row with {text}")
+    }
+
+    // The M/O column took width and had no legend. The path style shows the state instead:
+    // a path where nothing is mounted (fstab) is dim, also on the selected row.
+    #[test]
+    fn path_where_nothing_is_mounted_is_dim() {
+        let not_mounted_fstab_line = drives::Block {
+            mounted: false,
+            ..fstab_block("UUID=1234", "/mnt/backup")
+        };
+        let mut tui = Tui::default();
+        show(
+            &mut tui,
+            vec![
+                udisks_block("/dev/sda1", Some("/mnt/data")),
+                not_mounted_fstab_line,
+            ],
+        );
+        tui.input(KeyCode::Down.into());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| tui.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mounted = table_cell(buffer, "/mnt/data");
+        let not_mounted = table_cell(buffer, "/mnt/backup");
+        assert!(!mounted.modifier.contains(Modifier::DIM));
+        assert!(not_mounted.modifier.contains(Modifier::DIM));
+        assert_eq!(not_mounted.fg, Color::Green, "not the selected row");
+
+        let screen = draw(&mut tui);
+        for path in ["/mnt/data", "/mnt/backup"] {
+            let row = screen
+                .lines()
+                .find(|line| line.starts_with('│') && line.contains(path))
+                .unwrap();
+            assert!(
+                row.trim_end_matches('│').trim_end().ends_with(path),
+                "{row}"
+            );
         }
     }
 
